@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <ctype.h>
 
 #include <GL/gl.h>
 #include <GL/glut.h>
@@ -14,18 +15,23 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((b) < (a) ? (a) : (b))
 
+//////////// Natural cubic spline interpolation //////////////
 double *get_diff_polys(const double *x, const double *y, int n)
 {
-    double *y2 = malloc(sizeof(double) * n);
+    double *y2 = malloc(sizeof(double) * (n - 1));
     for (int i = 0; i < n - 1; i++)
     {
         y2[i] = (y[i] - y[i + 1]) / (x[i + 1] - x[i]);
     }
+
+    double *y3 = malloc(sizeof(double) * (n - 2));
     for (int i = 0; i < n - 2; i++)
     {
-        y2[i] = (y2[i] - y2[i + 1]) / (x[i + 2] - x[i]);
+        y3[i] = (y2[i] - y2[i + 1]) / (x[i + 2] - x[i]);
     }
-    return y2;
+
+    free(y2);
+    return y3;
 }
 
 typedef struct
@@ -40,16 +46,18 @@ nifs3_t *nifs3_init(const double *x, const double *y, int n)
 {
     nifs3_t *interp = malloc(sizeof(nifs3_t));
 
-    double *M = malloc(sizeof(double) * n);
+    double *M = malloc(sizeof(double) * (n + 1));
 
-    double *q = malloc(sizeof(double) * (n - 1));
-    double *u = malloc(sizeof(double) * (n - 1));
+    double *q = malloc(sizeof(double) * n);
+    double *u = malloc(sizeof(double) * n);
 
     double *d = get_diff_polys(x, y, n);
+    for (int i = 0; i < n - 2; i++)
+        d[i] *= 6;
 
     q[0] = u[0] = 0;
 
-    for (int i = 1; i < n - 1; i++)
+    for (int i = 1; i <= n - 1; i++)
     {
         double h_i = x[i] - x[i - 1];
         double h_i1 = x[i + 1] - x[i];
@@ -64,7 +72,7 @@ nifs3_t *nifs3_init(const double *x, const double *y, int n)
     M[n - 1] = u[n - 1];
 
     for (int i = n - 2; i > 0; i--)
-        M[i] = u[i] - q[i] * M[i + 1];
+        M[i] = u[i] + q[i] * M[i + 1];
 
     free(u);
     free(q);
@@ -94,11 +102,16 @@ void nifs3_free(nifs3_t *interp)
 double nifs3_get(nifs3_t *interp, double x)
 {
     if (x < interp->x[0] || x > interp->x[interp->n - 1])
-        return 0;
+    {
+        printf("x out of range\n");
+        exit(-1);
+    }
 
     int i = 0;
-    while (x > interp->x[i])
+    while (i < interp->n && x >= interp->x[i])
         i++;
+
+    i = min(max(1, i), interp->n);
 
     double h = interp->x[i] - interp->x[i - 1];
     double t1 = interp->x[i] - x;
@@ -110,93 +123,212 @@ double nifs3_get(nifs3_t *interp, double x)
                       (interp->y[i] - interp->M[i] / 6 * h * h) * t2);
 }
 
+///////////// 2D Interpolation //////////////
 typedef struct
 {
     nifs3_t *iX, *iY;
-
     double xMax, xMin, yMax, yMin;
 
+    int n;
+    double *u; // interpolation points
 } nifs3_2d_t;
 
 #define MAX_INTERPOLATORS 128
 nifs3_2d_t interp[MAX_INTERPOLATORS];
 
-void draw_interpolator(int inp, double *us, int n)
+void draw_nifs3_2d(int inp)
 {
-    glBegin(GL_LINE_STRIP);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < interp[inp].n; i++)
     {
-        double x = nifs3_get(interp[inp].iX, us[i]);
-        double y = nifs3_get(interp[inp].iY, us[i]);
+        double x = nifs3_get(interp[inp].iX, interp[inp].u[i]);
+        double y = nifs3_get(interp[inp].iY, interp[inp].u[i]);
         glVertex2d(x, y);
     }
-    glEnd();
 }
 
-void free_interpolator2d(int i)
+void free_nifs3_2d(int i)
 {
     nifs3_free(interp[i].iX);
     nifs3_free(interp[i].iY);
+    free(interp[i].u);
     memset(&interp[i], 0, sizeof(nifs3_2d_t));
 }
 
-void free_interpolator2ds()
+void cleanup_nifs3_2d()
 {
     for (int i = 0; i < MAX_INTERPOLATORS; i++)
-        free_interpolator2d(i);
+        free_nifs3_2d(i);
 }
 
-int create_interpolator2d(const double *x, const double *y, const double *t, int n)
+void set_nifs3_2d_interpolation_pts(int i, const double *u, int n)
+{
+    assert(interp[i].iX != NULL);
+    interp[i].n = n;
+    free(interp[i].u);
+    interp[i].u = malloc(sizeof(double) * n);
+    memcpy(interp[i].u, u, sizeof(double) * n);
+}
+
+int create_nifs3_2d(const double *x, const double *y, const double *t, int n)
 {
     for (int i = 0; i < MAX_INTERPOLATORS; i++)
     {
-        if (interp[i].iX == NULL)
+        if (interp[i].iX != NULL)
+            continue;
+
+        interp[i].iX = nifs3_init(t, x, n);
+        interp[i].iY = nifs3_init(t, y, n);
+
+        interp[i].xMin = INFINITY;
+        interp[i].xMax = -INFINITY;
+        interp[i].yMin = INFINITY;
+        interp[i].yMax = -INFINITY;
+
+        for (int j = 0; j < n; j++)
         {
-            interp[i].iX = nifs3_init(t, x, n);
-            interp[i].iY = nifs3_init(t, y, n);
-
-            interp[i].xMin = INFINITY;
-            interp[i].xMax = -INFINITY;
-            interp[i].yMin = INFINITY;
-            interp[i].yMax = -INFINITY;
-
-            for (int j = 0; j < n; j++)
-            {
-                interp[i].xMin = min(interp[i].xMin, x[j]);
-                interp[i].xMax = max(interp[i].xMax, x[j]);
-                interp[i].yMin = min(interp[i].yMin, y[j]);
-                interp[i].yMax = max(interp[i].yMax, y[j]);
-            }
-
-            return i;
+            interp[i].xMin = min(interp[i].xMin, x[j]);
+            interp[i].xMax = max(interp[i].xMax, x[j]);
+            interp[i].yMin = min(interp[i].yMin, y[j]);
+            interp[i].yMax = max(interp[i].yMax, y[j]);
         }
+
+        set_nifs3_2d_interpolation_pts(i, t, n);
+
+        return i;
     }
+
+    assert(false && "No free 2d interpolators");
     return -1;
 }
 
-const double Xs[] = {5.5, 8.5, 10.5, 13, 17, 20.5, 24.5, 28, 32.5, 37.5, 40.5, 42.5, 45, 47,
-                     49.5, 50.5, 51, 51.5, 52.5, 53, 52.8, 52, 51.5, 53, 54, 55, 56, 55.5, 54.5, 54, 55, 57, 58.5,
-                     59, 61.5, 62.5, 63.5, 63, 61.5, 59, 55, 53.5, 52.5, 50.5, 49.5, 50, 51, 50.5, 49, 47.5, 46,
-                     45.5, 45.5, 45.5, 46, 47.5, 47.5, 46, 43, 41, 41.5, 41.5, 41, 39.5, 37.5, 34.5, 31.5, 28, 24,
-                     21, 18.5, 17.5, 16.5, 15, 13, 10, 8, 6, 6, 6, 5.5, 3.5, 1, 0, 0, 0.5, 1.5, 3.5, 5, 5, 4.5, 4.5, 5.5,
-                     6.5, 6.5, 5.5};
-const double Ys[] = {41, 40.5, 40, 40.5, 41.5, 41.5, 42, 42.5, 43.5, 45, 47, 49.5, 53, 57, 59,
-                     59.5, 61.5, 63, 64, 64.5, 63, 61.5, 60.5, 61, 62, 63, 62.5, 61.5, 60.5, 60, 59.5, 59, 58.5,
-                     57.5, 55.5, 54, 53, 51.5, 50, 50, 50.5, 51, 50.5, 47.5, 44, 40.5, 36, 30.5, 28, 25.5, 21.5,
-                     18, 14.5, 10.5, 7.50, 4, 2.50, 1.50, 2, 3.50, 7, 12.5, 17.5, 22.5, 25, 25, 25, 25.5, 26.5,
-                     27.5, 27.5, 26.5, 23.5, 21, 19, 17, 14.5, 11.5, 8, 4, 1, 0, 0.5, 3, 6.50, 10, 13, 16.5, 20.5,
-                     25.5, 29, 33, 35, 36.5, 39, 41};
+///////////// Loading 2d interpolators from file //////////////
+double *get_line_array(FILE *fh, int *count)
+{
+    int real_count = 0;
+    int capacity = 32;
+    double *arr = malloc(sizeof(double) * capacity);
 
-#define countof(x) (sizeof(x) / sizeof(x[0]))
+    while (fscanf(fh, "%lf", &arr[real_count]) > 0)
+    {
+        real_count++;
 
-#define N 1000
-double Us[N];
+        int c;
+        while (isspace(c = fgetc(fh)) && c != '\n' && c != EOF)
+        {
+        }
 
+        if (c == '\n' || c == EOF)
+            break;
+
+        ungetc(c, fh);
+
+        if (real_count < capacity)
+            continue;
+
+        capacity *= 2;
+        arr = realloc(arr, sizeof(double) * capacity);
+    }
+
+    arr = realloc(arr, sizeof(double) * real_count);
+    *count = real_count;
+    return arr;
+}
+
+bool load_from_file(const char *path)
+{
+    cleanup_nifs3_2d();
+
+    FILE *fh = fopen(path, "r");
+    if (fh == NULL)
+    {
+        printf("Failed to open file %s\n", path);
+        return false;
+    }
+
+    while (!feof(fh))
+    {
+        // get to next non-whitespace character
+        int c;
+        while (isspace(c = fgetc(fh)) && c != EOF)
+        {
+        }
+        if (c == EOF)
+            break;
+
+        ungetc(c, fh);
+
+        int nx, ny, nt, nu;
+        double *x = get_line_array(fh, &nx);
+        double *y = get_line_array(fh, &ny);
+        double *t = get_line_array(fh, &nt);
+        double *u = get_line_array(fh, &nu);
+
+        if (nx == 0 && ny == 0 && nt == 0 && nu == 0)
+            break;
+
+        printf("nx: %d, ny: %d, nt: %d, nu: %d\n", nx, ny, nt, nu);
+
+        if (nx != ny || nx != nt || nx == 0 || nu == 0)
+        {
+            printf("Invalid file format\n");
+            cleanup_nifs3_2d();
+            return false;
+        }
+
+        int i = create_nifs3_2d(x, y, t, nt);
+        set_nifs3_2d_interpolation_pts(i, u, nu);
+    }
+
+    return true;
+}
+
+void save_to_file(const char *path)
+{
+    FILE *fh = fopen(path, "w");
+    if (fh == NULL)
+    {
+        printf("Failed to open file %s\n", path);
+        return;
+    }
+
+    for (int i = 0; i < MAX_INTERPOLATORS; i++)
+    {
+        if (interp[i].iX == NULL)
+            continue;
+
+        for (int j = 0; j < interp[i].iX->n; j++)
+            fprintf(fh, "%lf ", interp[i].iX->y[j]); // Xs
+        fprintf(fh, "\n");
+
+        for (int j = 0; j < interp[i].iY->n; j++)
+            fprintf(fh, "%lf ", interp[i].iY->y[j]); // Ys
+        fprintf(fh, "\n");
+
+        for (int j = 0; j < interp[i].iX->n; j++)
+            fprintf(fh, "%lf ", interp[i].iX->x[j]); // Ts
+        fprintf(fh, "\n");
+
+        for (int j = 0; j < interp[i].n; j++)
+            fprintf(fh, "%lf ", interp[i].u[j]); // Us
+        fprintf(fh, "\n");
+
+        fprintf(fh, "\n");
+    }
+}
+
+///////////// APPLICATION //////////////
 void linspace(double start, double end, int n, double *data)
 {
     double step = (end - start) / (n - 1);
     for (int i = 0; i < n; i++)
         data[i] = start + i * step;
+}
+
+double *alloc_linspace(double start, double end, int n)
+{
+    double *data = malloc(sizeof(double) * n);
+    linspace(start, end, n, data);
+    return data;
 }
 
 struct scene_data_t
@@ -221,14 +353,9 @@ struct scene_data_t
 
 void init()
 {
-    assert(countof(Xs) == countof(Ys));
-
-    const int n = countof(Xs);
-    double Ts[n];
-    linspace(0, 1, n, Ts);
-    linspace(0, 1, N, Us);
-
-    create_interpolator2d(Xs, Ys, Ts, n);
+    bool ok = load_from_file("zadanie7.data");
+    if (!ok)
+        exit(1);
 
     // create window
     glutInitDisplayMode(GLUT_SINGLE | GLUT_RGB);
@@ -270,7 +397,7 @@ void init()
     stbi_set_flip_vertically_on_load(true);
 
     int components = 4;
-    stbi_uc *data = stbi_load("image.png", &scene_data.imageW, &scene_data.imageH, &components, 4);
+    stbi_uc *data = stbi_load("image_transparent.png", &scene_data.imageW, &scene_data.imageH, &components, 4);
     if (data == NULL)
     {
         printf("Failed to load image\n");
@@ -363,8 +490,10 @@ void drawText()
             scene_data.xMin, scene_data.xMax,
             scene_data.yMin, scene_data.yMax);
 
+    glColor3f(0, 0, 1);
     for (char *s = str; *s; s++)
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *s);
+    glColor3f(1, 1, 1);
 
     glPopMatrix();
 
@@ -422,8 +551,25 @@ void display()
     {
         if (interp[i].iX == NULL)
             continue;
+
+        glColor3f(1, 0, 0);
+        glBegin(GL_LINE_STRIP);
+        draw_nifs3_2d(i);
+        glEnd();
+
+        glColor3f(0, 1, 0);
+        glPointSize(2);
+        glBegin(GL_POINTS);
+        draw_nifs3_2d(i);
+        glEnd();
+
+        glColor3f(0, 0, 1);
+        glPointSize(4);
+        glBegin(GL_POINTS);
+        for (int j = 0; j < interp[i].iX->n; j++)
+            glVertex2d(interp[i].iX->y[j], interp[i].iY->y[j]);
+        glEnd();
         glColor3f(1, 1, 1);
-        draw_interpolator(i, Us, N);
     }
 
     glutSwapBuffers();
@@ -443,7 +589,7 @@ int main(int argc, char **argv)
     glutDisplayFunc(display);
     glutMainLoop();
 
-    free_interpolator2ds();
+    cleanup_nifs3_2d();
 
     return 0;
 }
