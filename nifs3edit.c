@@ -15,6 +15,21 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((b) < (a) ? (a) : (b))
 
+/////////// Linspace //////////////
+void linspace(double start, double end, int n, double *data)
+{
+    double step = (end - start) / (n - 1);
+    for (int i = 0; i < n; i++)
+        data[i] = start + i * step;
+}
+
+double *alloc_linspace(double start, double end, int n)
+{
+    double *data = malloc(sizeof(double) * n);
+    linspace(start, end, n, data);
+    return data;
+}
+
 //////////// Natural cubic spline interpolation //////////////
 double *get_diff_polys(const double *x, const double *y, int n)
 {
@@ -44,9 +59,28 @@ typedef struct
 
 nifs3_t *nifs3_init(const double *x, const double *y, int n)
 {
+    assert(n >= 0);
     nifs3_t *interp = malloc(sizeof(nifs3_t));
 
     double *M = malloc(sizeof(double) * (n + 1));
+
+    interp->x = malloc(max(sizeof(double) * n, 1));
+    interp->y = malloc(max(sizeof(double) * n, 1));
+    interp->M = M;
+    interp->n = n;
+
+    if (n != 0)
+    {
+        memcpy(interp->x, x, sizeof(double) * n);
+        memcpy(interp->y, y, sizeof(double) * n);
+    }
+
+    if (n <= 2)
+    {
+        for (int i = 0; i <= n; i++)
+            M[i] = 0;
+        return interp;
+    }
 
     double *q = malloc(sizeof(double) * n);
     double *u = malloc(sizeof(double) * n);
@@ -78,14 +112,6 @@ nifs3_t *nifs3_init(const double *x, const double *y, int n)
     free(q);
     free(d);
 
-    interp->x = malloc(sizeof(double) * n);
-    interp->y = malloc(sizeof(double) * n);
-    interp->M = M;
-    interp->n = n;
-
-    memcpy(interp->x, x, sizeof(double) * n);
-    memcpy(interp->y, y, sizeof(double) * n);
-
     return interp;
 }
 
@@ -101,17 +127,20 @@ void nifs3_free(nifs3_t *interp)
 
 double nifs3_get(nifs3_t *interp, double x)
 {
-    if (x < interp->x[0] || x > interp->x[interp->n - 1])
+    if (interp->n == 0)
+        return 0;
+
+    if (x < interp->x[0] || x > interp->x[interp->n - 1] * 1.0001)
     {
-        printf("x out of range\n");
-        exit(-1);
+        printf("x out of range (%g)\n", x);
+        return 0;
     }
 
-    int i = 0;
+    int i = 1;
     while (i < interp->n && x >= interp->x[i])
         i++;
 
-    i = min(max(1, i), interp->n);
+    i = min(max(1, i), interp->n - 1);
 
     double h = interp->x[i] - interp->x[i - 1];
     double t1 = interp->x[i] - x;
@@ -201,6 +230,37 @@ int create_nifs3_2d(const double *x, const double *y, const double *t, int n)
     return -1;
 }
 
+// assumes that interpolation nodes are in linspace
+void add_node_nifs3_2d(int i, double x, double y)
+{
+    if (interp[i].iX == NULL)
+        return;
+
+    int n = interp[i].iX->n;
+    double *x_ = interp[i].iX->y;
+    double *y_ = interp[i].iY->y;
+
+    double *t = alloc_linspace(0, 1, n + 1);
+    double *px = malloc(sizeof(double) * (n + 1));
+    double *py = malloc(sizeof(double) * (n + 1));
+    memcpy(px, x_, sizeof(double) * n);
+    memcpy(py, y_, sizeof(double) * n);
+    px[n] = x;
+    py[n] = y;
+
+    nifs3_free(interp[i].iX);
+    nifs3_free(interp[i].iY);
+    interp[i].iX = nifs3_init(t, px, n + 1);
+    interp[i].iY = nifs3_init(t, py, n + 1);
+    free(t);
+    free(px);
+    free(py);
+
+    double *u = alloc_linspace(0, 1, 10 * (n + 1));
+    set_nifs3_2d_interpolation_pts(i, u, 10 * (n + 1));
+    free(u);
+}
+
 ///////////// Loading 2d interpolators from file //////////////
 double *get_line_array(FILE *fh, int *count)
 {
@@ -266,12 +326,9 @@ bool load_from_file(const char *path)
         if (nx == 0 && ny == 0 && nt == 0 && nu == 0)
             break;
 
-        printf("nx: %d, ny: %d, nt: %d, nu: %d\n", nx, ny, nt, nu);
-
         if (nx != ny || nx != nt || nx == 0 || nu == 0)
         {
             printf("Invalid file format\n");
-            cleanup_nifs3_2d();
             return false;
         }
 
@@ -317,18 +374,52 @@ void save_to_file(const char *path)
 }
 
 ///////////// APPLICATION //////////////
-void linspace(double start, double end, int n, double *data)
+
+enum mode
 {
-    double step = (end - start) / (n - 1);
-    for (int i = 0; i < n; i++)
-        data[i] = start + i * step;
+    MODE_NONE,
+    MODE_SAVE,
+    MODE_LOAD,
+    MODE_SET_U,
+    MODE_SELECT_EDIT
+};
+
+const char *mode_to_text(enum mode mode)
+{
+    switch (mode)
+    {
+    case MODE_NONE:
+        return "None";
+    case MODE_SAVE:
+        return "Save";
+    case MODE_LOAD:
+        return "Load";
+    case MODE_SET_U:
+        return "Set U";
+    case MODE_SELECT_EDIT:
+        return "Select edit interpolator";
+    default:
+        return "Unknown";
+    }
 }
 
-double *alloc_linspace(double start, double end, int n)
+bool is_inputting_text(enum mode mode)
 {
-    double *data = malloc(sizeof(double) * n);
-    linspace(start, end, n, data);
-    return data;
+    switch (mode)
+    {
+    case MODE_NONE:
+        return false;
+    case MODE_SAVE:
+        return true;
+    case MODE_LOAD:
+        return true;
+    case MODE_SET_U:
+        return true;
+    case MODE_SELECT_EDIT:
+        return true;
+    default:
+        return false;
+    }
 }
 
 struct scene_data_t
@@ -349,7 +440,22 @@ struct scene_data_t
     int imageW, imageH;
     int texture;
 
+    enum mode mode;
+    char text[1024];
+
+    int edit_interpolator_i;
+
+    char error[1024];
+
 } scene_data;
+
+void print_error(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(scene_data.error, sizeof(scene_data.error), fmt, args);
+    va_end(args);
+}
 
 void init()
 {
@@ -415,6 +521,9 @@ void init()
                  components == 4 ? GL_RGBA : GL_RGB, GL_UNSIGNED_BYTE, data);
     stbi_image_free(data);
     glDisable(GL_TEXTURE_2D);
+
+    scene_data.mode = MODE_NONE;
+    scene_data.edit_interpolator_i = -1;
 }
 
 void mouse(int button, int state, int x, int y)
@@ -438,10 +547,124 @@ void mouse(int button, int state, int x, int y)
     glutPostRedisplay();
 }
 
-void keyboard(unsigned char c, int x, int y)
+void timer()
 {
-    if (c == 'i')
-        scene_data.showImage = !scene_data.showImage;
+    glutPostRedisplay();
+    glutTimerFunc(10, timer, 0);
+}
+
+void keyboard(unsigned char c, int x_, int y_)
+{
+    double x = scene_data.xMin + (scene_data.xMax - scene_data.xMin) * ((double)x_ / scene_data.w);
+    double y = scene_data.yMin + (scene_data.yMax - scene_data.yMin) * ((double)(scene_data.h - y_) / scene_data.h);
+
+    if (is_inputting_text(scene_data.mode))
+    {
+        int i;
+
+        switch (c)
+        {
+        case 27: // esc
+            scene_data.mode = MODE_NONE;
+            scene_data.text[0] = '\0';
+            break;
+        case 13: // enter
+            switch (scene_data.mode)
+            {
+            case MODE_SAVE:
+                save_to_file(scene_data.text);
+                break;
+            case MODE_LOAD:
+                if (!load_from_file(scene_data.text))
+                    print_error("Failed to load file: %s", scene_data.text);
+                break;
+            case MODE_SET_U:
+                sscanf(scene_data.text, "%d", &i);
+                double *u = alloc_linspace(0, 1, i);
+                set_nifs3_2d_interpolation_pts(scene_data.edit_interpolator_i, u, i);
+                free(u);
+                break;
+            case MODE_SELECT_EDIT:
+                sscanf(scene_data.text, "%d", &i);
+                scene_data.edit_interpolator_i = i;
+                break;
+            }
+            scene_data.mode = MODE_NONE;
+            scene_data.text[0] = '\0';
+
+            break;
+        case 8: // backspace
+            int l = strlen(scene_data.text);
+            if (l == 0)
+                break;
+            scene_data.text[l - 1] = '\0';
+            break;
+        default:
+            if (!isprint(c))
+                break;
+
+            if (strlen(scene_data.text) < sizeof(scene_data.text) - 1)
+            {
+                scene_data.text[strlen(scene_data.text) + 1] = '\0';
+                scene_data.text[strlen(scene_data.text)] = c;
+            }
+            break;
+        }
+    }
+    else
+    {
+        switch (c)
+        {
+        case 'i':
+            scene_data.showImage = !scene_data.showImage;
+            break;
+        case 'c':
+            cleanup_nifs3_2d();
+            break;
+        case 's':
+            scene_data.mode = MODE_SAVE;
+            break;
+        case 'l':
+            scene_data.mode = MODE_LOAD;
+            break;
+        case 'u':
+            if (scene_data.edit_interpolator_i == -1)
+            {
+                print_error("No interpolator selected");
+                break;
+            }
+            scene_data.mode = MODE_SET_U;
+            break;
+        case 'e':
+            scene_data.mode = MODE_SELECT_EDIT;
+            break;
+        case 'd':
+            if (scene_data.edit_interpolator_i == -1)
+            {
+                print_error("No interpolator selected");
+                break;
+            }
+            free_nifs3_2d(scene_data.edit_interpolator_i);
+            scene_data.edit_interpolator_i = -1;
+            break;
+        case 'n':
+            scene_data.edit_interpolator_i = create_nifs3_2d(NULL, NULL, NULL, 0);
+            break;
+        case 'q':
+            exit(0);
+            break;
+        case 'a':
+            if (scene_data.edit_interpolator_i == -1)
+            {
+                print_error("No interpolator selected");
+                break;
+            }
+
+            add_node_nifs3_2d(scene_data.edit_interpolator_i, x, y);
+
+            break;
+        }
+    }
 
     glutPostRedisplay();
 }
@@ -473,7 +696,7 @@ void reshape(int w, int h)
     glutPostRedisplay();
 }
 
-void drawText()
+void drawText(const char *str, int x, int y)
 {
     glMatrixMode(GL_PROJECTION);
     glPushMatrix();
@@ -483,17 +706,10 @@ void drawText()
     glMatrixMode(GL_MODELVIEW);
     glPushMatrix();
     glLoadIdentity();
-    glRasterPos2i(10, scene_data.h - 40); // move in 10 pixels from the left and bottom edges
+    glRasterPos2i(10 + x, scene_data.h - 40 - y); // move in 10 pixels from the left and bottom edges
 
-    char str[1024];
-    sprintf(str, "X: [%f %f], Y: [%f %f]",
-            scene_data.xMin, scene_data.xMax,
-            scene_data.yMin, scene_data.yMax);
-
-    glColor3f(0, 0, 1);
-    for (char *s = str; *s; s++)
+    for (const char *s = str; *s; s++)
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *s);
-    glColor3f(1, 1, 1);
 
     glPopMatrix();
 
@@ -525,6 +741,7 @@ void display()
 
     if (scene_data.showImage)
     {
+        glColor3f(1, 1, 1);
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, scene_data.texture);
         glBegin(GL_QUADS);
@@ -540,30 +757,60 @@ void display()
         glDisable(GL_TEXTURE_2D);
     }
 
-    drawText();
+    glColor3f(1, 1, 1);
+    char str[1024];
+    sprintf(str, "X: [%f %f], Y: [%f %f]",
+            scene_data.xMin, scene_data.xMax,
+            scene_data.yMin, scene_data.yMax);
+    drawText(str, 0, 0);
+
+    if (is_inputting_text(scene_data.mode))
+    {
+        drawText(mode_to_text(scene_data.mode), 0, 20);
+        drawText(scene_data.text, 0, 40);
+    }
+    glColor3f(1, 1, 1);
+
+    glColor3f(1, 0, 0);
+    drawText(scene_data.error, 0, 60);
+    glColor3f(1, 1, 1);
 
     glLoadIdentity();
     glOrtho(scene_data.xMin, scene_data.xMax,
             scene_data.yMin, scene_data.yMax,
             -1, 1);
 
+    int t = glutGet(GLUT_ELAPSED_TIME);
+
     for (int i = 0; i < MAX_INTERPOLATORS; i++)
     {
         if (interp[i].iX == NULL)
             continue;
 
-        glColor3f(1, 0, 0);
+        if (scene_data.edit_interpolator_i == i && t % 1000 < 500)
+            glColor3f(1, 1, 1);
+        else
+            glColor3f(1, 0, 0);
+
         glBegin(GL_LINE_STRIP);
         draw_nifs3_2d(i);
         glEnd();
 
-        glColor3f(0, 1, 0);
+        if (scene_data.edit_interpolator_i == i && t % 1000 < 500)
+            glColor3f(1, 1, 1);
+        else
+            glColor3f(0, 1, 0);
+
         glPointSize(2);
         glBegin(GL_POINTS);
         draw_nifs3_2d(i);
         glEnd();
 
-        glColor3f(0, 0, 1);
+        if (scene_data.edit_interpolator_i == i && t % 1000 < 500)
+            glColor3f(1, 1, 1);
+        else
+            glColor3f(0, 0, 1);
+
         glPointSize(4);
         glBegin(GL_POINTS);
         for (int j = 0; j < interp[i].iX->n; j++)
@@ -580,6 +827,7 @@ int main(int argc, char **argv)
     glutInit(&argc, argv);
 
     init();
+    atexit(cleanup_nifs3_2d);
 
     // set up callback functions
     glutMouseFunc(mouse);
@@ -587,9 +835,8 @@ int main(int argc, char **argv)
     glutMotionFunc(motion);
     glutReshapeFunc(reshape);
     glutDisplayFunc(display);
+    glutTimerFunc(10, timer, 0);
     glutMainLoop();
-
-    cleanup_nifs3_2d();
 
     return 0;
 }
