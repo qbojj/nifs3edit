@@ -282,11 +282,11 @@ double *get_line_array(FILE *fh, int *count)
 
         ungetc(c, fh);
 
-        if (real_count < capacity)
-            continue;
-
-        capacity *= 2;
-        arr = realloc(arr, sizeof(double) * capacity);
+        if (real_count >= capacity)
+        {
+            capacity *= 2;
+            arr = realloc(arr, sizeof(double) * capacity);
+        }
     }
 
     arr = realloc(arr, sizeof(double) * real_count);
@@ -307,16 +307,6 @@ bool load_from_file(const char *path)
 
     while (!feof(fh))
     {
-        // get to next non-whitespace character
-        int c;
-        while (isspace(c = fgetc(fh)) && c != EOF)
-        {
-        }
-        if (c == EOF)
-            break;
-
-        ungetc(c, fh);
-
         int nx, ny, nt, nu;
         double *x = get_line_array(fh, &nx);
         double *y = get_line_array(fh, &ny);
@@ -326,14 +316,18 @@ bool load_from_file(const char *path)
         if (nx == 0 && ny == 0 && nt == 0 && nu == 0)
             break;
 
-        if (nx != ny || nx != nt || nx == 0 || nu == 0)
+        if (nx != nt || ny != nt || nt == 0 || nu == 0)
         {
-            printf("Invalid file format\n");
+            printf("Invalid file format (%d %d %d %d)\n", nx, ny, nt, nu);
             return false;
         }
 
         int i = create_nifs3_2d(x, y, t, nt);
         set_nifs3_2d_interpolation_pts(i, u, nu);
+        free(x);
+        free(y);
+        free(t);
+        free(u);
     }
 
     return true;
@@ -382,7 +376,8 @@ enum mode
     MODE_LOAD,
     MODE_SET_U,
     MODE_SELECT_EDIT,
-    MODE_OPTIMIZE
+    MODE_OPTIMIZE,
+    MODE_OPTIMIZE_ALL
 };
 
 const char *mode_to_text(enum mode mode)
@@ -400,31 +395,18 @@ const char *mode_to_text(enum mode mode)
     case MODE_SELECT_EDIT:
         return "Select edit interpolator";
     case MODE_OPTIMIZE:
-        return "Optimize interpolator locations (enter min cos(angle))";
+        return "Optimize interpolator locations (Douglas-Peucker algorithm - epsilon)";
+    case MODE_OPTIMIZE_ALL:
+        return "Optimize all interpolator locations (Douglas-Peucker algorithm - epsilon)";
     default:
+        assert(false && "Unknown mode");
         return "Unknown";
     }
 }
 
 bool is_inputting_text(enum mode mode)
 {
-    switch (mode)
-    {
-    case MODE_NONE:
-        return false;
-    case MODE_SAVE:
-        return true;
-    case MODE_LOAD:
-        return true;
-    case MODE_SET_U:
-        return true;
-    case MODE_SELECT_EDIT:
-        return true;
-    case MODE_OPTIMIZE:
-        return true;
-    default:
-        return false;
-    }
+    return mode != MODE_NONE;
 }
 
 struct scene_data_t
@@ -558,6 +540,68 @@ void timer()
     glutTimerFunc(10, timer, 0);
 }
 
+void douglas_prucker(double *x, double *y, int n, double epsilon, bool *keep)
+{
+    keep[0] = keep[n - 1] = true;
+
+    double dmax = -1.f;
+    int index = 0;
+
+    double dx = x[n - 1] - x[0];
+    double dy = y[n - 1] - y[0];
+
+    double dlen = sqrt(dx * dx + dy * dy);
+    dx /= dlen;
+    dy /= dlen;
+
+    for (int i = 1; i < n - 1; i++)
+    {
+        double d = fabs((x[i] - x[0]) * dy - (y[i] - y[0]) * dx);
+        if (d > dmax)
+        {
+            index = i;
+            dmax = d;
+        }
+    }
+
+    if (dmax > epsilon)
+    {
+        douglas_prucker(x, y, index + 1, epsilon, keep);
+        douglas_prucker(x + index, y + index, n - index, epsilon, keep + index);
+    }
+}
+
+void optimize_nifs3_2d(int i, double epsilon)
+{
+    nifs3_2d_t *intp = &interp[i];
+
+    // Douglas-Peucker algorithm
+    int count = 1024 * 32;
+    double *u = alloc_linspace(intp->iX->x[0], intp->iX->x[intp->iX->n - 1], count);
+    bool *keep = calloc(count, sizeof(bool));
+
+    double *x = malloc(sizeof(double) * count);
+    double *y = malloc(sizeof(double) * count);
+
+    for (int i = 0; i < count; i++)
+    {
+        x[i] = nifs3_get(intp->iX, u[i]);
+        y[i] = nifs3_get(intp->iY, u[i]);
+    }
+
+    douglas_prucker(x, y, count, epsilon, keep);
+    free(x);
+    free(y);
+
+    int n = 0;
+    for (int i = 0; i < count; i++)
+        if (keep[i])
+            u[n++] = u[i];
+
+    set_nifs3_2d_interpolation_pts(i, u, n);
+    free(u);
+}
+
 void keyboard(unsigned char c, int x_, int y_)
 {
     double x = scene_data.xMin + (scene_data.xMax - scene_data.xMin) * ((double)x_ / scene_data.w);
@@ -598,67 +642,14 @@ void keyboard(unsigned char c, int x_, int y_)
                 break;
             case MODE_OPTIMIZE:
                 sscanf(scene_data.text, "%lf", &d);
-                {
-                    int count = 1024 * 8;
-                    double *u = alloc_linspace(0, 1, count);
-                    double *newU = malloc(count * sizeof(double));
-                    int newUn = 0;
-
-                    nifs3_2d_t *intp = &interp[scene_data.edit_interpolator_i];
-
-                    double takenX = nifs3_get(intp->iX, u[0]);
-                    double takenY = nifs3_get(intp->iY, u[0]);
-
-                    newU[newUn++] = u[0];
-                    double takenDx = nifs3_get(intp->iX, u[1]) - takenX;
-                    double takenDy = nifs3_get(intp->iY, u[1]) - takenY;
-
-                    {
-                        double takenDlen = sqrt(takenDx * takenDx + takenDy * takenDy);
-                        takenDx /= takenDlen;
-                        takenDy /= takenDlen;
-                    }
-
-                    printf("takenDx: %lf, takenDy: %lf\n", takenDx, takenDy);
-
-                    double lastX = takenX;
-                    double lastY = takenY;
-
-                    for (int i = 1; i < count - 1; i++)
-                    {
-                        double x = nifs3_get(intp->iX, u[i]);
-                        double y = nifs3_get(intp->iY, u[i]);
-
-                        // (p - lastP) * N
-                        double dist = fabs((x - takenX) * takenDy - (y - takenY) * takenDx);
-                        if (dist >= d)
-                        {
-                            newU[newUn++] = u[i];
-
-                            double dx = x - lastX;
-                            double dy = y - lastY;
-
-                            double dlen = sqrt(dx * dx + dy * dy);
-                            dx /= dlen;
-                            dy /= dlen;
-
-                            takenDx = dx;
-                            takenDy = dy;
-                            takenX = x;
-                            takenY = y;
-                        }
-
-                        lastX = x;
-                        lastY = y;
-                    }
-
-                    newU[newUn++] = u[count - 1];
-                    newU = realloc(newU, newUn * sizeof(double));
-
-                    set_nifs3_2d_interpolation_pts(scene_data.edit_interpolator_i, newU, newUn);
-                    free(newU);
-                    break;
-                }
+                optimize_nifs3_2d(scene_data.edit_interpolator_i, d);
+                break;
+            case MODE_OPTIMIZE_ALL:
+                sscanf(scene_data.text, "%lf", &d);
+                for (int i = 0; i < MAX_INTERPOLATORS; i++)
+                    if (interp[i].iX != NULL)
+                        optimize_nifs3_2d(i, d);
+                break;
             }
             scene_data.mode = MODE_NONE;
             scene_data.text[0] = '\0';
@@ -741,6 +732,9 @@ void keyboard(unsigned char c, int x_, int y_)
                 break;
             }
             scene_data.mode = MODE_OPTIMIZE;
+            break;
+        case 'O':
+            scene_data.mode = MODE_OPTIMIZE_ALL;
             break;
         }
     }
