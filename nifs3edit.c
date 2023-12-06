@@ -381,7 +381,8 @@ enum mode
     MODE_SAVE,
     MODE_LOAD,
     MODE_SET_U,
-    MODE_SELECT_EDIT
+    MODE_SELECT_EDIT,
+    MODE_OPTIMIZE
 };
 
 const char *mode_to_text(enum mode mode)
@@ -398,6 +399,8 @@ const char *mode_to_text(enum mode mode)
         return "Set U";
     case MODE_SELECT_EDIT:
         return "Select edit interpolator";
+    case MODE_OPTIMIZE:
+        return "Optimize interpolator locations (enter min cos(angle))";
     default:
         return "Unknown";
     }
@@ -416,6 +419,8 @@ bool is_inputting_text(enum mode mode)
     case MODE_SET_U:
         return true;
     case MODE_SELECT_EDIT:
+        return true;
+    case MODE_OPTIMIZE:
         return true;
     default:
         return false;
@@ -561,6 +566,7 @@ void keyboard(unsigned char c, int x_, int y_)
     if (is_inputting_text(scene_data.mode))
     {
         int i;
+        double d;
 
         switch (c)
         {
@@ -586,8 +592,73 @@ void keyboard(unsigned char c, int x_, int y_)
                 break;
             case MODE_SELECT_EDIT:
                 sscanf(scene_data.text, "%d", &i);
+                if (i < 0 || i >= MAX_INTERPOLATORS || interp[i].iX == NULL)
+                    i = -1;
                 scene_data.edit_interpolator_i = i;
                 break;
+            case MODE_OPTIMIZE:
+                sscanf(scene_data.text, "%lf", &d);
+                {
+                    int count = 1024 * 8;
+                    double *u = alloc_linspace(0, 1, count);
+                    double *newU = malloc(count * sizeof(double));
+                    int newUn = 0;
+
+                    nifs3_2d_t *intp = &interp[scene_data.edit_interpolator_i];
+
+                    double takenX = nifs3_get(intp->iX, u[0]);
+                    double takenY = nifs3_get(intp->iY, u[0]);
+
+                    newU[newUn++] = u[0];
+                    double takenDx = nifs3_get(intp->iX, u[1]) - takenX;
+                    double takenDy = nifs3_get(intp->iY, u[1]) - takenY;
+
+                    {
+                        double takenDlen = sqrt(takenDx * takenDx + takenDy * takenDy);
+                        takenDx /= takenDlen;
+                        takenDy /= takenDlen;
+                    }
+
+                    printf("takenDx: %lf, takenDy: %lf\n", takenDx, takenDy);
+
+                    double lastX = takenX;
+                    double lastY = takenY;
+
+                    for (int i = 1; i < count - 1; i++)
+                    {
+                        double x = nifs3_get(intp->iX, u[i]);
+                        double y = nifs3_get(intp->iY, u[i]);
+
+                        // (p - lastP) * N
+                        double dist = fabs((x - takenX) * takenDy - (y - takenY) * takenDx);
+                        if (dist >= d)
+                        {
+                            newU[newUn++] = u[i];
+
+                            double dx = x - lastX;
+                            double dy = y - lastY;
+
+                            double dlen = sqrt(dx * dx + dy * dy);
+                            dx /= dlen;
+                            dy /= dlen;
+
+                            takenDx = dx;
+                            takenDy = dy;
+                            takenX = x;
+                            takenY = y;
+                        }
+
+                        lastX = x;
+                        lastY = y;
+                    }
+
+                    newU[newUn++] = u[count - 1];
+                    newU = realloc(newU, newUn * sizeof(double));
+
+                    set_nifs3_2d_interpolation_pts(scene_data.edit_interpolator_i, newU, newUn);
+                    free(newU);
+                    break;
+                }
             }
             scene_data.mode = MODE_NONE;
             scene_data.text[0] = '\0';
@@ -613,6 +684,8 @@ void keyboard(unsigned char c, int x_, int y_)
     }
     else
     {
+        print_error("");
+
         switch (c)
         {
         case 'i':
@@ -659,9 +732,15 @@ void keyboard(unsigned char c, int x_, int y_)
                 print_error("No interpolator selected");
                 break;
             }
-
             add_node_nifs3_2d(scene_data.edit_interpolator_i, x, y);
-
+            break;
+        case 'o':
+            if (scene_data.edit_interpolator_i == -1)
+            {
+                print_error("No interpolator selected");
+                break;
+            }
+            scene_data.mode = MODE_OPTIMIZE;
             break;
         }
     }
